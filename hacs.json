@@ -1,0 +1,5 @@
+{
+  "name": "Alarmo ↔ Zigbee2MQTT Keypad Bridge",
+  "description": "Professional asynchronous bridge for Zigbee keypads and Alarmo integration.",
+  "render_readme": true
+}
