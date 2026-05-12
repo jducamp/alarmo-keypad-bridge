@@ -1,40 +1,64 @@
 blueprint:
-  name: Alarmo ↔ Zigbee2MQTT Keypad Sync
+  name: Alarmo ↔ Zigbee2MQTT Keypad Sync (Event-Driven)
   description: >
-    Asynchronous, native bidirectional bridge between Alarmo and a Zigbee keypad (e.g., KEYZB-110).
-    Handles hardware acknowledgments (ACK) and state synchronization without blocking execution.
+    Strictly event-driven bidirectional bridge. Complies with ZCL specifications by separating hardware ACKs from state updates.
   domain: automation
   input:
     alarmo_entity:
       name: Alarmo Entity
-      description: The Alarmo control panel entity to synchronize.
+      description: The Alarmo control panel entity.
       selector:
         entity:
           domain: alarm_control_panel
     mqtt_topic:
       name: Keypad MQTT Topic
-      description: "The base topic defined in Zigbee2MQTT (e.g., zigbee2mqtt/Keypad). Do not include the trailing /set."
+      description: "Base topic (e.g., zigbee2mqtt/Keypad)."
       selector:
         text: {}
+    tx_helper:
+      name: Transaction ID Helper
+      description: "An input_number entity (min -1)."
+      selector:
+        entity:
+          domain: input_number
+    action_helper:
+      name: Requested Action Helper
+      description: "An input_text entity."
+      selector:
+        entity:
+          domain: input_text
 
-mode: parallel
-max: 10
+mode: queued
+max: 50
 
 trigger:
+  # Trigger 1: Hardware Request
   - trigger: mqtt
     topic: !input mqtt_topic
     id: keypad_request
 
+  # Trigger 2: State Change (Success/Sync)
   - trigger: state
     entity_id: !input alarmo_entity
     id: alarmo_state
+
+  # Trigger 3: Immediate Failure
+  - trigger: event
+    event_type: alarmo_failed_to_arm
+    id: alarmo_failed
 
 variables:
   panel_entity: !input alarmo_entity
   base_topic: !input mqtt_topic
   keypad_topic: "{{ base_topic }}/set"
+  tx_entity: !input tx_helper
+  action_entity: !input action_helper
   
-  # Mapping: System State -> Keypad Display
+  # Read global memory
+  current_tx: "{{ states(tx_entity) | int(-1) }}"
+  current_action: "{{ states(action_entity) }}"
+  
+  # Full allowed sync states for Z2M
   state_to_keypad:
     disarmed: disarm
     armed_away: arm_all_zones
@@ -44,7 +68,6 @@ variables:
     arming: exit_delay
     pending: entry_delay
     
-  # Mapping: Keypad Action -> System Command
   keypad_to_alarmo_mode:
     arm_all_zones: away
     arm_day_zones: home
@@ -53,7 +76,7 @@ variables:
 action:
   - choose:
       # ───────────────────────────────────────────────
-      # FLOW 1: HARDWARE REQUEST (Keypad -> Alarmo)
+      # PATH 1: DISPATCH COMMAND & SAVE STATE
       # ───────────────────────────────────────────────
       - conditions:
           - condition: trigger
@@ -69,7 +92,20 @@ action:
               req_code: "{{ trigger.payload_json.action_code | default('') }}"
               req_tx: "{{ trigger.payload_json.action_transaction }}"
 
-          # Forwarding command to Alarmo
+          # Write to global memory synchronously
+          - action: input_number.set_value
+            target:
+              entity_id: !input tx_helper
+            data:
+              value: "{{ req_tx | float }}"
+              
+          - action: input_text.set_value
+            target:
+              entity_id: !input action_helper
+            data:
+              value: "{{ req_action }}"
+
+          # Dispatch command
           - choose:
               - conditions: "{{ req_action == 'disarm' }}"
                 sequence:
@@ -78,64 +114,100 @@ action:
                       entity_id: "{{ panel_entity }}"
                     data:
                       code: "{{ req_code }}"
-              - conditions: "{{ req_action in keypad_to_alarmo_mode.keys() }}"
-                sequence:
-                  - action: alarmo.arm
-                    target:
-                      entity_id: "{{ panel_entity }}"
-                    data:
-                      mode: "{{ keypad_to_alarmo_mode[req_action] }}"
-                      code: "{{ req_code }}"
-
-          # Ultra-short wait for Alarmo's immediate acknowledgment
-          - alias: "Wait for action result"
-            wait_for_trigger:
-              - trigger: event
-                event_type: alarmo_failed_to_arm
-                id: ko
-              - trigger: state
-                entity_id: !input alarmo_entity
-                to:
-                  - arming
-                  - armed_away
-                  - armed_home
-                  - armed_night
-                  - disarmed
-                id: ok
-            timeout: "00:00:10"
-            continue_on_timeout: true
-
-          # Strict response handling (Hardware ACK with Transaction ID)
-          - variables:
-              outcome_id: "{{ wait.trigger.id if wait.trigger is defined else 'timeout' }}"
-              ack_mode: >-
-                {% if outcome_id == 'ok' %}{{ req_action }}
-                {%- elif outcome_id == 'ko' %}not_ready
-                {%- else %}invalid_code{% endif %}
-
-          - action: mqtt.publish
-            data:
-              topic: "{{ keypad_topic }}"
-              qos: 1
-              payload: >-
-                {{ {'arm_mode': {'transaction': req_tx, 'mode': ack_mode}} | tojson }}
+            default:
+              - action: alarmo.arm
+                target:
+                  entity_id: "{{ panel_entity }}"
+                data:
+                  mode: "{{ keypad_to_alarmo_mode[req_action] }}"
+                  code: "{{ req_code }}"
 
       # ───────────────────────────────────────────────
-      # FLOW 2: SYNCHRONIZATION (Alarmo -> Keypad)
+      # PATH 2: STATE CHANGE (ACK & SYNC)
       # ───────────────────────────────────────────────
       - conditions:
           - condition: trigger
             id: alarmo_state
           - condition: template
             value_template: "{{ trigger.to_state.state in state_to_keypad.keys() }}"
-          # Anti-spam safeguard: verify the state actually changed
           - condition: template
             value_template: >
               {{ trigger.from_state is not none and trigger.from_state.state != trigger.to_state.state }}
         sequence:
+          - variables:
+              mapped_mode: "{{ state_to_keypad[trigger.to_state.state] }}"
+
+          - choose:
+              # Scenario 2A: Resolving a pending hardware transaction
+              - conditions:
+                  - condition: template
+                    value_template: "{{ current_tx >= 0 }}"
+                sequence:
+                  # 1. Send strict hardware ACK (requires transaction ID and requested action)
+                  - action: mqtt.publish
+                    data:
+                      topic: "{{ keypad_topic }}"
+                      qos: 1
+                      payload: >-
+                        {{ {'arm_mode': {'transaction': current_tx, 'mode': current_action}} | tojson }}
+                  
+                  # 2. Immediately follow up with the actual system state (e.g., exit_delay)
+                  - action: mqtt.publish
+                    data:
+                      topic: "{{ keypad_topic }}"
+                      qos: 1
+                      payload: >-
+                        {{ {'arm_mode': {'mode': mapped_mode}} | tojson }}
+                  
+                  # 3. Wipe memory
+                  - action: input_number.set_value
+                    target:
+                      entity_id: !input tx_helper
+                    data:
+                      value: -1
+                  - action: input_text.set_value
+                    target:
+                      entity_id: !input action_helper
+                    data:
+                      value: ""
+
+              # Scenario 2B: General state sync (no active hardware transaction)
+              - conditions:
+                  - condition: template
+                    value_template: "{{ current_tx == -1 }}"
+                sequence:
+                  - action: mqtt.publish
+                    data:
+                      topic: "{{ keypad_topic }}"
+                      qos: 1
+                      payload: >-
+                        {{ {'arm_mode': {'mode': mapped_mode}} | tojson }}
+
+      # ───────────────────────────────────────────────
+      # PATH 3: HARDWARE ACK (FAILURE)
+      # ───────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: alarmo_failed
+          - condition: template
+            value_template: "{{ current_tx >= 0 }}"
+        sequence:
+          # Send strict hardware NACK
           - action: mqtt.publish
             data:
               topic: "{{ keypad_topic }}"
               qos: 1
               payload: >-
-                {{ {'arm_mode': {'mode': state_to_keypad[trigger.to_state.state]}} | tojson }}
+                {{ {'arm_mode': {'transaction': current_tx, 'mode': 'invalid_code'}} | tojson }}
+
+          # Wipe memory
+          - action: input_number.set_value
+            target:
+              entity_id: !input tx_helper
+            data:
+              value: -1
+          - action: input_text.set_value
+            target:
+              entity_id: !input action_helper
+            data:
+              value: ""
